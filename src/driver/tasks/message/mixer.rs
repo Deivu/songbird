@@ -5,7 +5,7 @@ use super::UdpRxMessage;
 use super::{Interconnect, TrackContext, WsMessage};
 
 use crate::{
-    driver::{crypto::Cipher, Bitrate, Config, CryptoState},
+    driver::{crypto::Cipher, Bitrate, Config, CryptoState, Filter},
     input::{AudioStreamError, Compose, Parsed},
 };
 use flume::Sender;
@@ -30,6 +30,7 @@ pub enum MixerMessage {
     SetTrack(Option<Box<TrackContext>>),
 
     SetBitrate(Bitrate),
+    UpdateFilters(Vec<Filter>),
     SetConfig(Config),
     SetMute(bool),
 

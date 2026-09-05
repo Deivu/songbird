@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 
 use crate::{
-    driver::{connection::error::Error, Bitrate, Config},
+    driver::{connection::error::Error, Bitrate, Config, Filter},
     events::{context_data::DisconnectReason, EventData},
     tracks::{Track, TrackCommand, TrackHandle},
     ConnectionInfo,
@@ -16,6 +16,7 @@ pub enum CoreMessage {
     SetTrack(Option<Box<TrackContext>>),
     AddTrack(Box<TrackContext>),
     SetBitrate(Bitrate),
+    UpdateFilters(Vec<Filter>),
     AddEvent(EventData),
     RemoveGlobalEvents,
     SetConfig(Config),
