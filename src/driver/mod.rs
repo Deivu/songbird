@@ -15,6 +15,7 @@ pub(crate) mod connection;
 mod crypto;
 #[cfg(feature = "receive")]
 mod decode_mode;
+mod filters;
 mod mix_mode;
 pub mod retry;
 mod scheduler;
@@ -29,6 +30,8 @@ pub use crypto::CryptoMode;
 pub(crate) use crypto::CryptoState;
 #[cfg(feature = "receive")]
 pub use decode_mode::*;
+pub(crate) use filters::FilterChain;
+pub use filters::{AudioFilter, Filter, Pcm};
 pub use mix_mode::MixMode;
 pub use scheduler::{
     get_default_scheduler,
@@ -218,6 +221,16 @@ impl Driver {
     #[instrument(skip(self))]
     pub fn set_bitrate(&mut self, bitrate: Bitrate) {
         self.send(CoreMessage::SetBitrate(bitrate));
+    }
+
+    #[allow(missing_docs)]
+    #[instrument(skip(self, filters))]
+    pub fn update_filters(&mut self, filters: Vec<Filter>) {
+        if filters.is_empty() {
+            return;
+        }
+
+        self.send(CoreMessage::UpdateFilters(filters));
     }
 
     /// Stops playing audio from all sources, if any are set.

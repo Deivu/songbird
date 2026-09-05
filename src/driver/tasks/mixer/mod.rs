@@ -1,3 +1,4 @@
+mod filter;
 pub mod mix_logic;
 mod pool;
 mod result;
@@ -5,6 +6,7 @@ pub mod state;
 pub mod track;
 mod util;
 
+use filter::FilterState;
 use pool::*;
 use result::*;
 use state::*;
@@ -80,6 +82,7 @@ pub struct Mixer {
     sample_buffer: SampleBuffer<f32>,
     symph_mix: AudioBuffer<f32>,
     resample_scratch: AudioBuffer<f32>,
+    filter_state: Option<FilterState>,
 
     #[cfg(test)]
     pub remaining_loops: Option<u64>,
@@ -166,6 +169,7 @@ impl Mixer {
             sample_buffer,
             symph_mix,
             resample_scratch,
+            filter_state: None,
 
             #[cfg(test)]
             remaining_loops: None,
@@ -245,6 +249,16 @@ impl Mixer {
                 if let Err(e) = self.set_bitrate(b) {
                     error!("Failed to update bitrate {:?}", e);
                 }
+                Ok(())
+            },
+            MixerMessage::UpdateFilters(filters) => {
+                let filter_state = self.filter_state.get_or_insert_default();
+                filter_state.update(filters, MONO_FRAME_SIZE);
+
+                if filter_state.is_empty() {
+                    self.filter_state = None;
+                }
+
                 Ok(())
             },
             MixerMessage::SetMute(m) => {
@@ -517,22 +531,66 @@ impl Mixer {
     }
 
     #[inline]
-    pub fn mix_and_build_packet(&mut self, packet: &mut [u8]) -> Result<usize> {
-        // symph_mix is an `AudioBuffer` (planar format), we need to convert this
-        // later into an interleaved `SampleBuffer` for libopus.
+    fn mix_pcm_input_frame(&mut self, packet: &mut [u8]) -> MixType {
         self.symph_mix.clear();
         self.symph_mix.render_reserved(Some(MONO_FRAME_SIZE));
         self.resample_scratch.clear();
 
-        // Walk over all the audio files, combining into one audio frame according
-        // to volume, play state, etc.
-        let mut mix_len = {
-            let out = self.mix_tracks(packet);
+        let out = self.mix_tracks(packet);
+        self.sample_buffer.copy_interleaved_typed(&self.symph_mix);
 
-            self.sample_buffer.copy_interleaved_typed(&self.symph_mix);
+        out
+    }
 
-            out
+    #[inline]
+    fn mix_filtered_pcm(&mut self, packet: &mut [u8]) -> MixType {
+        let channels = self.config.mix_mode.channels();
+        let output_samples = self.config.mix_mode.sample_count_in_frame();
+
+        while self.filter_state.as_ref().is_some_and(|filter_state| {
+            filter_state.has_filters() && filter_state.queued_samples() < output_samples
+        }) {
+            let MixType::MixedPcm(input_frames) = self.mix_pcm_input_frame(packet) else {
+                unreachable!();
+            };
+
+            if input_frames == 0 {
+                break;
+            }
+
+            let input_samples = input_frames * channels;
+            let input = &self.sample_buffer.samples()[..input_samples];
+
+            let Some(output_frames) = self
+                .filter_state
+                .as_mut()
+                .and_then(|filter_state| filter_state.process(input, input_frames, channels))
+            else {
+                error!("Filter output exceeded the allocated buffer");
+                break;
+            };
+
+            if output_frames == 0 {
+                break;
+            }
+        }
+
+        let output_frames = self.filter_state.as_mut().map_or(0, |filter_state| {
+            filter_state.copy_output(self.sample_buffer.samples_mut(), channels)
+        });
+
+        MixType::MixedPcm(output_frames)
+    }
+
+    #[inline]
+    pub fn mix_and_build_packet(&mut self, packet: &mut [u8]) -> Result<usize> {
+        let mut mix_len = if self.filter_state.is_some() {
+            self.mix_filtered_pcm(packet)
+        } else {
+            self.mix_pcm_input_frame(packet)
         };
+
+        self.filter_state.take_if(FilterState::is_empty);
 
         if self.muted {
             mix_len = MixType::MixedPcm(0);
@@ -780,6 +838,11 @@ impl Mixer {
             }
         }
         let do_passthrough = num_live == 1 && (last_live_vol - 1.0).abs() < f32::EPSILON;
+        let do_passthrough = do_passthrough
+            && self
+                .filter_state
+                .as_ref()
+                .is_none_or(|filter_state| !filter_state.has_filters());
 
         let mut len = 0;
         for (i, track) in self.tracks.iter_mut().enumerate() {
