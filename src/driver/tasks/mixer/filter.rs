@@ -1,121 +1,155 @@
-use crate::constants::SAMPLE_RATE;
-use crate::driver::{Filter, FilterChain, Pcm};
-use std::collections::VecDeque;
-use tracing::error;
+use crate::{
+    constants::STEREO_FRAME_SIZE,
+    driver::{AudioFilter, FilterRegistry},
+};
+use std::{any::Any, mem, ops::Range};
+use tracing::{error, warn};
 
-#[derive(Default)]
-pub struct FilterState {
-    filters: FilterChain,
-    output: Vec<f32>,
-    output_frames: usize,
-    pending_output: VecDeque<f32>,
-    channels: usize,
+struct FilterEntry {
+    name: String,
+    filter: Box<dyn AudioFilter>,
+    failing: bool,
 }
 
-impl FilterState {
-    pub fn update(&mut self, updates: Vec<Filter>, input_frames: usize) {
-        if self.filters.is_empty() {
-            return;
-        }
+#[derive(Default)]
+pub struct FilterChain {
+    entries: Vec<FilterEntry>,
+    current: Vec<f32>,
+    next: Vec<f32>,
+    tail: Range<usize>,
+}
 
-        for filter in updates {
-            if let Err(e) = filter.apply(&mut self.filters) {
-                error!("Failed to update filter {:?}", e);
-            }
-        }
-
-        let mut output_frames = input_frames;
-        let mut max_output_frames = input_frames;
-
-        for filter in self.filters.filters() {
-            output_frames = filter.max_output_frames(output_frames);
-            max_output_frames = max_output_frames.max(output_frames);
-        }
-
-        self.output.resize(max_output_frames * 2, 0.0);
-        self.output_frames = max_output_frames;
-
-        let required_samples = (input_frames + max_output_frames) * 2;
-
-        if self.pending_output.capacity() < required_samples {
-            self.pending_output
-                .reserve(required_samples.saturating_sub(self.pending_output.len()));
-        }
-    }
-
-    pub fn process(
-        &mut self,
-        input: &[f32],
-        input_frames: usize,
-        channels: usize,
-    ) -> Option<usize> {
-        self.update_channels(channels);
-
-        let input_samples = input_frames.checked_mul(channels)?;
-
-        if input.len() < input_samples || self.output.len() < input_samples {
-            return None;
-        }
-
-        self.output[..input_samples].copy_from_slice(&input[..input_samples]);
-
-        let mut output_frames = input_frames;
-
-        for filter in self.filters.filters_mut() {
-            output_frames = filter.process(Pcm {
-                samples: &mut self.output,
-                frames: output_frames,
-                sample_rate: SAMPLE_RATE,
-                channels: channels as u32,
-            });
-
-            if output_frames > self.output_frames {
-                return None;
-            }
-        }
-
-        let output_samples = output_frames.checked_mul(channels)?;
-
-        if output_samples > self.pending_output.capacity() - self.pending_output.len() {
-            return None;
-        }
-
-        self.pending_output
-            .extend(self.output[..output_samples].iter().copied());
-
-        Some(output_frames)
-    }
-
-    pub fn copy_output(&mut self, output: &mut [f32], channels: usize) -> usize {
-        self.update_channels(channels);
-
-        let samples_to_copy = self.pending_output.len().min(output.len());
-
-        for sample in &mut output[..samples_to_copy] {
-            *sample = self.pending_output.pop_front().unwrap();
-        }
-
-        output[samples_to_copy..].fill(0.0);
-
-        samples_to_copy / channels
-    }
-
-    pub fn has_filters(&self) -> bool {
-        !self.filters.is_empty()
-    }
-
-    pub fn queued_samples(&self) -> usize {
-        self.pending_output.len()
-    }
-
+impl FilterChain {
     pub fn is_empty(&self) -> bool {
-        self.filters.is_empty() && self.pending_output.is_empty()
+        self.entries.is_empty()
     }
 
-    fn update_channels(&mut self, channels: usize) {
-        if self.channels != channels {
-            self.pending_output.clear();
-            self.channels = channels;
+    pub fn set(&mut self, filters: Vec<(String, Box<dyn Any + Send>)>, registry: &FilterRegistry) {
+        let mut entries = Vec::with_capacity(filters.len());
+
+        for (name, config) in filters {
+            if entries.iter().any(|entry: &FilterEntry| entry.name == name) {
+                warn!(
+                    "Filter {} was given more than once, keeping the first",
+                    name
+                );
+                continue;
+            }
+
+            let existing = self.entries.iter().position(|entry| entry.name == name);
+            let mut entry = if let Some(index) = existing {
+                self.entries.swap_remove(index)
+            } else {
+                match registry.create(&name) {
+                    Some(Ok(filter)) => FilterEntry {
+                        name,
+                        filter,
+                        failing: false,
+                    },
+                    Some(Err(e)) => {
+                        error!("Filter {} could not be created: {}", name, e);
+                        continue;
+                    },
+                    None => {
+                        warn!("No filter named {}", name);
+                        continue;
+                    },
+                }
+            };
+
+            if let Err(e) = entry.filter.configure(config) {
+                error!("Filter {} rejected its config: {}", entry.name, e);
+            }
+
+            entries.push(entry);
+        }
+
+        self.entries = entries;
+
+        if self.entries.is_empty() {
+            self.tail = 0..0;
+        } else if self.current.is_empty() {
+            self.current = vec![0.0; STEREO_FRAME_SIZE];
+            self.next = vec![0.0; STEREO_FRAME_SIZE];
+        }
+    }
+
+    // Audio which the output has no room for is kept in `next`, and returned by the
+    // following calls before any filter runs. Callers drain the chain with an empty
+    // input until it returns 0 before passing new audio.
+    pub fn process(&mut self, input: &[f32], output: &mut [f32], channels: usize) -> usize {
+        if !self.tail.is_empty() {
+            debug_assert!(input.is_empty());
+
+            let end = self.tail.end.min(self.tail.start + output.len());
+            let held = &self.next[self.tail.start..end];
+
+            output[..held.len()].copy_from_slice(held);
+            self.tail.start = end;
+
+            return held.len() / channels;
+        }
+
+        let remaining = output.len() / channels;
+        let buffer_frames = self.next.len() / channels;
+        let last = self.entries.len().saturating_sub(1);
+        let mut frames = input.len() / channels;
+
+        for (index, entry) in self.entries.iter_mut().enumerate() {
+            let source = if index == 0 {
+                &input[..frames * channels]
+            } else {
+                &self.current[..frames * channels]
+            };
+            let overflows = index == last && frames > remaining;
+            let target = if index == last && !overflows {
+                &mut output[..]
+            } else {
+                let capacity = frames.max(remaining).min(buffer_frames);
+
+                &mut self.next[..capacity * channels]
+            };
+            let capacity = target.len() / channels;
+
+            frames = match entry.filter.process(source, target, channels) {
+                Ok(written) => {
+                    entry.failing = false;
+
+                    written.min(capacity)
+                },
+                Err(e) => {
+                    if !entry.failing {
+                        error!("Filter {} failed, passing audio through: {}", entry.name, e);
+                        entry.failing = true;
+                    }
+
+                    let passed = frames.min(capacity);
+                    target[..passed * channels].copy_from_slice(&source[..passed * channels]);
+
+                    passed
+                },
+            };
+
+            if index != last {
+                mem::swap(&mut self.current, &mut self.next);
+            } else if overflows {
+                let written = frames * channels;
+                let fits = written.min(remaining * channels);
+
+                output[..fits].copy_from_slice(&self.next[..fits]);
+                self.tail = fits..written;
+                frames = fits / channels;
+            }
+        }
+
+        frames
+    }
+
+    pub fn reset(&mut self) {
+        self.tail = 0..0;
+
+        for entry in &mut self.entries {
+            entry.filter.reset();
         }
     }
 }

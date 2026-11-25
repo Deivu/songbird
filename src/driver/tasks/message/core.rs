@@ -1,12 +1,13 @@
 #![allow(missing_docs)]
 
 use crate::{
-    driver::{connection::error::Error, Bitrate, Config, Filter},
+    driver::{connection::error::Error, Bitrate, Config},
     events::{context_data::DisconnectReason, EventData},
     tracks::{Track, TrackCommand, TrackHandle},
     ConnectionInfo,
 };
 use flume::{Receiver, Sender};
+use std::any::Any;
 
 pub enum CoreMessage {
     ConnectWithResult(ConnectionInfo, Sender<Result<(), Error>>),
@@ -16,7 +17,7 @@ pub enum CoreMessage {
     SetTrack(Option<Box<TrackContext>>),
     AddTrack(Box<TrackContext>),
     SetBitrate(Bitrate),
-    UpdateFilters(Vec<Filter>),
+    SetFilters(Vec<(String, Box<dyn Any + Send>)>),
     AddEvent(EventData),
     RemoveGlobalEvents,
     SetConfig(Config),

@@ -33,6 +33,9 @@ pub(crate) const RESAMPLE_OUTPUT_FRAME_SIZE: usize = MONO_FRAME_SIZE / 2;
 /// The maximum number of bad frames to allow in an Opus source before blocking passthrough.
 pub(crate) const OPUS_PASSTHROUGH_STRIKE_LIMIT: u8 = 3;
 
+/// The maximum number of times filters are drained or given new audio while filling one frame.
+pub(crate) const MAX_FILTER_ROUNDS: usize = 16;
+
 /// Number of samples in one complete frame of audio per channel.
 ///
 /// This is equally the number of stereo (joint) samples in an audio frame.

@@ -149,12 +149,8 @@ async fn runner(mut config: Config, rx: Receiver<CoreMessage>, tx: Sender<CoreMe
             CoreMessage::SetBitrate(b) => {
                 drop(interconnect.mixer.send(MixerMessage::SetBitrate(b)));
             },
-            CoreMessage::UpdateFilters(filters) => {
-                drop(
-                    interconnect
-                        .mixer
-                        .send(MixerMessage::UpdateFilters(filters)),
-                );
+            CoreMessage::SetFilters(filters) => {
+                drop(interconnect.mixer.send(MixerMessage::SetFilters(filters)));
             },
             CoreMessage::SetConfig(mut new_config) => {
                 next_config = Some(new_config.clone());

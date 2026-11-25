@@ -113,7 +113,18 @@ impl AsyncAdapterSink {
                 AdapterRequest::Seek(pos) => {
                     pause_buf_moves = true;
                     drop(self.resp_tx.send_async(AdapterResponse::SeekClear).await);
-                    seek_res = Some(self.stream.seek(pos).await);
+
+                    let res = self.stream.seek(pos).await;
+
+                    // seeks now throw everything that read before it.
+                    // avoids issues with: unexpected EBML element
+                    if let Ok(pos) = &res {
+                        seen_bytes = *pos;
+                    }
+
+                    read_region = 0..0;
+                    hit_end = false;
+                    seek_res = Some(res);
                 },
                 AdapterRequest::SeekCleared => {
                     if let Some(res) = seek_res.take() {
@@ -124,6 +135,7 @@ impl AsyncAdapterSink {
                         );
                     }
                     pause_buf_moves = false;
+                    blocked = false;
                 },
             }
         }
@@ -277,12 +289,12 @@ impl Seek for AsyncAdapterStream {
 
         // wait for async to tell us that it has stopped writing,
         // then clear buf and allow async to write again.
-        self.finalised.store(false, Ordering::Relaxed);
         match self.handle_messages(Operation::Seek) {
             Some(AdapterResponse::SeekClear) => {},
             None => self.check_dropped().map(|()| unreachable!())?,
             _ => unreachable!(),
         }
+        self.finalised.store(false, Ordering::Relaxed);
 
         let mut rb = self.bytes_out.lock();
         let cap = rb.capacity();
