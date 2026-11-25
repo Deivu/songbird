@@ -22,7 +22,17 @@ use crate::{
     driver::{CryptoMode, MixMode},
     events::EventStore,
     input::{Input, Parsed},
-    tracks::{Action, LoopState, PlayError, PlayMode, TrackCommand, TrackHandle, TrackState, View},
+    tracks::{
+        Action,
+        LoopState,
+        PlayError,
+        PlayMode,
+        SeekRequest,
+        TrackCommand,
+        TrackHandle,
+        TrackState,
+        View,
+    },
     Config,
 };
 use discortp::{
@@ -237,9 +247,17 @@ impl Mixer {
         let error = match msg {
             MixerMessage::AddTrack(t) => self.add_track(*t),
             MixerMessage::SetTrack(t) => {
+                let interrupts = self
+                    .tracks
+                    .iter()
+                    .any(|track| !matches!(track.playing, PlayMode::End | PlayMode::Errored(_)));
+
+                if t.is_none() || interrupts {
+                    self.filters.reset();
+                }
+
                 self.tracks.clear();
                 self.track_handles.clear();
-                self.filters.reset();
 
                 let mut out = self.fire_event(EventMessage::RemoveAllTracks);
 
@@ -486,6 +504,7 @@ impl Mixer {
             }
         }
 
+        let mut stopped = false;
         let mut i = 0;
         while i < self.tracks.len() {
             let track = self
@@ -495,6 +514,7 @@ impl Mixer {
 
             if track.playing.is_done() {
                 let p_state = track.playing.clone();
+                stopped = stopped || matches!(p_state, PlayMode::Stop);
                 let to_drop = self.tracks.swap_remove(i);
                 self.disposer
                     .dispose(DisposalMessage::Track(Box::new(to_drop)));
@@ -511,7 +531,7 @@ impl Mixer {
             }
         }
 
-        if self.tracks.is_empty() {
+        if stopped && self.tracks.is_empty() {
             self.filters.reset();
         }
 
@@ -664,7 +684,7 @@ impl Mixer {
             }
 
             let output = &mut self.sample_buffer.samples_mut()[filled..total];
-            let drained = self.filters.process(&[], output, channels);
+            let drained = self.filters.process(&[], output, channels, false);
 
             if drained != 0 {
                 filled += drained * channels;
@@ -680,7 +700,20 @@ impl Mixer {
             };
 
             if frames == 0 {
-                break;
+                if self.tracks.iter().any(InternalTrack::can_continue) {
+                    break;
+                }
+
+                let output = &mut self.sample_buffer.samples_mut()[filled..total];
+
+                filled += self.filters.process(&[], output, channels, true) * channels;
+
+                if self.filters.is_finished() {
+                    self.filters.reset();
+                    break;
+                }
+
+                continue;
             }
 
             self.filter_input.copy_interleaved_typed(&self.symph_mix);
@@ -692,7 +725,7 @@ impl Mixer {
             let input = &self.filter_input.samples()[..frames * channels];
             let output = &mut self.sample_buffer.samples_mut()[filled..total];
 
-            filled += self.filters.process(input, output, channels) * channels;
+            filled += self.filters.process(input, output, channels, false) * channels;
         }
 
         self.sample_buffer.samples_mut()[filled..total].fill(0.0);
@@ -945,7 +978,6 @@ impl Mixer {
                 MixStatus::Errored(e) =>
                     track.playing = PlayMode::Errored(PlayError::Decode(e.into())),
                 MixStatus::Ended if track.do_loop() => {
-                    drop(self.track_handles[i].seek(Duration::default()));
                     if !self.prevent_events {
                         // position update is sent out later, when the seek concludes.
                         drop(self.interconnect.events.send(EventMessage::ChangeState(
@@ -953,6 +985,20 @@ impl Mixer {
                             TrackStateChange::Loops(track.loops, false),
                         )));
                     }
+
+                    let (callback, _) = flume::bounded(1);
+
+                    track.seek(
+                        i,
+                        SeekRequest {
+                            time: Duration::default(),
+                            callback,
+                        },
+                        &self.interconnect,
+                        &self.thread_pool,
+                        &self.config,
+                        self.prevent_events,
+                    );
                 },
                 MixStatus::Ended => {
                     track.end();

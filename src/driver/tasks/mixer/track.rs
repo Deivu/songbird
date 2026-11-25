@@ -164,6 +164,11 @@ impl<'a> InternalTrack {
         self.playing.is_playing() || matches!(self.input, InputState::Preparing(_))
     }
 
+    /// Returns whether more audio can directly follow what this track has played so far.
+    pub(crate) fn can_continue(&self) -> bool {
+        !self.playing.is_done() && matches!(self.input, InputState::Ready(..))
+    }
+
     pub(crate) fn end(&mut self) -> &mut Self {
         self.playing.change_to(PlayMode::End);
 

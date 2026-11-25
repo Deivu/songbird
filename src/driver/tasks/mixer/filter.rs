@@ -17,11 +17,16 @@ pub struct FilterChain {
     current: Vec<f32>,
     next: Vec<f32>,
     tail: Range<usize>,
+    finished: bool,
 }
 
 impl FilterChain {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
     }
 
     pub fn set(&mut self, filters: Vec<(String, Box<dyn Any + Send>)>, registry: &FilterRegistry) {
@@ -77,7 +82,13 @@ impl FilterChain {
     // Audio which the output has no room for is kept in `next`, and returned by the
     // following calls before any filter runs. Callers drain the chain with an empty
     // input until it returns 0 before passing new audio.
-    pub fn process(&mut self, input: &[f32], output: &mut [f32], channels: usize) -> usize {
+    pub fn process(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+        channels: usize,
+        mut last: bool,
+    ) -> usize {
         if !self.tail.is_empty() {
             debug_assert!(input.is_empty());
 
@@ -92,7 +103,7 @@ impl FilterChain {
 
         let remaining = output.len() / channels;
         let buffer_frames = self.next.len() / channels;
-        let last = self.entries.len().saturating_sub(1);
+        let last_index = self.entries.len().saturating_sub(1);
         let mut frames = input.len() / channels;
 
         for (index, entry) in self.entries.iter_mut().enumerate() {
@@ -101,8 +112,8 @@ impl FilterChain {
             } else {
                 &self.current[..frames * channels]
             };
-            let overflows = index == last && frames > remaining;
-            let target = if index == last && !overflows {
+            let overflows = index == last_index && frames > remaining;
+            let target = if index == last_index && !overflows {
                 &mut output[..]
             } else {
                 let capacity = frames.max(remaining).min(buffer_frames);
@@ -111,7 +122,7 @@ impl FilterChain {
             };
             let capacity = target.len() / channels;
 
-            frames = match entry.filter.process(source, target, channels) {
+            frames = match entry.filter.process(source, target, channels, last) {
                 Ok(written) => {
                     entry.failing = false;
 
@@ -130,7 +141,9 @@ impl FilterChain {
                 },
             };
 
-            if index != last {
+            last = last && frames == 0;
+
+            if index != last_index {
                 mem::swap(&mut self.current, &mut self.next);
             } else if overflows {
                 let written = frames * channels;
@@ -141,6 +154,8 @@ impl FilterChain {
                 frames = fits / channels;
             }
         }
+
+        self.finished = last;
 
         frames
     }

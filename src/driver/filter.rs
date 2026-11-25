@@ -99,6 +99,11 @@ pub trait AudioFilter: Send {
     /// later calls. An empty `input` asks the filter for audio it is holding, and
     /// returns 0 if there is none.
     ///
+    /// `last` marks that no more audio follows `input`, such as when a track ends. The
+    /// filter then also returns any audio it was holding back to wait for more input. This
+    /// is repeated with an empty `input` until the filter returns 0, which it must
+    /// eventually do. Audio given after that is the start of something new.
+    ///
     /// # Errors
     ///
     /// Returns an error if the input could not be processed. The input is then passed
@@ -108,6 +113,7 @@ pub trait AudioFilter: Send {
         input: &[f32],
         output: &mut [f32],
         channels: usize,
+        last: bool,
     ) -> Result<usize, FilterError>;
 
     /// Drops all held audio and history, such as after a seek or track change.
