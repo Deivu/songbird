@@ -565,6 +565,8 @@ impl Mixer {
 
     #[inline]
     pub fn mix_and_build_packet(&mut self, packet: &mut [u8]) -> Result<usize> {
+        self.filters.remove_idle();
+
         let mut mix_len = if self.filters.is_empty() {
             // symph_mix is an `AudioBuffer` (planar format), we need to convert this
             // later into an interleaved `SampleBuffer` for libopus.

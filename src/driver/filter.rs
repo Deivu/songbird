@@ -118,4 +118,17 @@ pub trait AudioFilter: Send {
 
     /// Drops all held audio and history, such as after a seek or track change.
     fn reset(&mut self);
+
+    /// Returns whether this filter passes audio through unchanged and holds no audio.
+    ///
+    /// An idle filter is removed from the chain, and an idle new filter is not added.
+    /// Once no filter remains, tracks may be sent without being decoded again.
+    ///
+    /// Defaults to `false`, so the filter stays in the chain until it is removed with
+    /// [`Driver::set_filters`].
+    ///
+    /// [`Driver::set_filters`]: crate::driver::Driver::set_filters
+    fn is_idle(&self) -> bool {
+        false
+    }
 }

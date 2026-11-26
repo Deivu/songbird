@@ -66,6 +66,10 @@ impl FilterChain {
                 error!("Filter {} rejected its config: {}", entry.name, e);
             }
 
+            if existing.is_none() && entry.filter.is_idle() {
+                continue;
+            }
+
             entries.push(entry);
         }
 
@@ -158,6 +162,12 @@ impl FilterChain {
         self.finished = last;
 
         frames
+    }
+
+    pub fn remove_idle(&mut self) {
+        if self.tail.is_empty() {
+            self.entries.retain(|entry| !entry.filter.is_idle());
+        }
     }
 
     pub fn reset(&mut self) {
