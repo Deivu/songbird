@@ -15,6 +15,7 @@ pub(crate) mod connection;
 mod crypto;
 #[cfg(feature = "receive")]
 mod decode_mode;
+mod filter;
 mod mix_mode;
 pub mod retry;
 mod scheduler;
@@ -29,6 +30,7 @@ pub use crypto::CryptoMode;
 pub(crate) use crypto::CryptoState;
 #[cfg(feature = "receive")]
 pub use decode_mode::*;
+pub use filter::{AudioFilter, FilterConstructor, FilterError, FilterRegistry};
 pub use mix_mode::MixMode;
 pub use scheduler::{
     get_default_scheduler,
@@ -62,6 +64,7 @@ use core::{
 use flume::{r#async::RecvFut, SendError, Sender};
 /// Opus encoder bitrate settings.
 pub use opus2::{self as opus, Bitrate};
+use std::any::Any;
 #[cfg(feature = "builtin-queue")]
 use std::time::Duration;
 #[allow(unused_imports)]
@@ -218,6 +221,19 @@ impl Driver {
     #[instrument(skip(self))]
     pub fn set_bitrate(&mut self, bitrate: Bitrate) {
         self.send(CoreMessage::SetBitrate(bitrate));
+    }
+
+    /// Sets the audio filters applied to the mixed audio, in order.
+    ///
+    /// Each entry is a filter name and its configuration. Active filters keep their
+    /// state and are reconfigured, new names are created from the filters registered with [`Config::add_filter`],
+    /// and active filters missing from `filters` are removed. An empty list removes
+    /// all filters.
+    ///
+    /// [`Config::add_filter`]: crate::Config::add_filter
+    #[instrument(skip(self, filters))]
+    pub fn set_filters(&mut self, filters: Vec<(String, Box<dyn Any + Send>)>) {
+        self.send(CoreMessage::SetFilters(filters));
     }
 
     /// Stops playing audio from all sources, if any are set.

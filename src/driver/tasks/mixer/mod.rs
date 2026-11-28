@@ -1,3 +1,4 @@
+mod filter;
 pub mod mix_logic;
 mod pool;
 mod result;
@@ -5,6 +6,7 @@ pub mod state;
 pub mod track;
 mod util;
 
+use filter::FilterChain;
 use pool::*;
 use result::*;
 use state::*;
@@ -20,7 +22,17 @@ use crate::{
     driver::{CryptoMode, MixMode},
     events::EventStore,
     input::{Input, Parsed},
-    tracks::{Action, LoopState, PlayError, PlayMode, TrackCommand, TrackHandle, TrackState, View},
+    tracks::{
+        Action,
+        LoopState,
+        PlayError,
+        PlayMode,
+        SeekRequest,
+        TrackCommand,
+        TrackHandle,
+        TrackState,
+        View,
+    },
     Config,
 };
 use discortp::{
@@ -81,6 +93,9 @@ pub struct Mixer {
     symph_mix: AudioBuffer<f32>,
     resample_scratch: AudioBuffer<f32>,
 
+    filters: FilterChain,
+    filter_input: SampleBuffer<f32>,
+
     #[cfg(test)]
     pub remaining_loops: Option<u64>,
 
@@ -138,6 +153,10 @@ impl Mixer {
             MONO_FRAME_SIZE as u64,
             SignalSpec::new_with_layout(SAMPLE_RATE_RAW as u32, Layout::Stereo),
         );
+        let filter_input = SampleBuffer::<f32>::new(
+            MONO_FRAME_SIZE as u64,
+            SignalSpec::new_with_layout(SAMPLE_RATE_RAW as u32, symph_layout),
+        );
 
         let deadline = Instant::now();
 
@@ -166,6 +185,9 @@ impl Mixer {
             sample_buffer,
             symph_mix,
             resample_scratch,
+
+            filters: FilterChain::default(),
+            filter_input,
 
             #[cfg(test)]
             remaining_loops: None,
@@ -225,6 +247,15 @@ impl Mixer {
         let error = match msg {
             MixerMessage::AddTrack(t) => self.add_track(*t),
             MixerMessage::SetTrack(t) => {
+                let interrupts = self
+                    .tracks
+                    .iter()
+                    .any(|track| !matches!(track.playing, PlayMode::End | PlayMode::Errored(_)));
+
+                if t.is_none() || interrupts {
+                    self.filters.reset();
+                }
+
                 self.tracks.clear();
                 self.track_handles.clear();
 
@@ -245,6 +276,10 @@ impl Mixer {
                 if let Err(e) = self.set_bitrate(b) {
                     error!("Failed to update bitrate {:?}", e);
                 }
+                Ok(())
+            },
+            MixerMessage::SetFilters(filters) => {
+                self.filters.set(filters, &self.config.filters);
                 Ok(())
             },
             MixerMessage::SetMute(m) => {
@@ -308,6 +343,11 @@ impl Mixer {
                         MONO_FRAME_SIZE as u64,
                         SignalSpec::new_with_layout(SAMPLE_RATE_RAW as u32, sl),
                     );
+                    self.filter_input = SampleBuffer::<f32>::new(
+                        MONO_FRAME_SIZE as u64,
+                        SignalSpec::new_with_layout(SAMPLE_RATE_RAW as u32, sl),
+                    );
+                    self.filters.reset();
                 }
 
                 self.config = Arc::new(
@@ -424,6 +464,7 @@ impl Mixer {
             let action = track.process_commands(i, &self.interconnect);
 
             if let Some(req) = action.seek_point {
+                self.filters.reset();
                 track.seek(
                     i,
                     req,
@@ -463,6 +504,7 @@ impl Mixer {
             }
         }
 
+        let mut stopped = false;
         let mut i = 0;
         while i < self.tracks.len() {
             let track = self
@@ -472,6 +514,7 @@ impl Mixer {
 
             if track.playing.is_done() {
                 let p_state = track.playing.clone();
+                stopped = stopped || matches!(p_state, PlayMode::Stop);
                 let to_drop = self.tracks.swap_remove(i);
                 self.disposer
                     .dispose(DisposalMessage::Track(Box::new(to_drop)));
@@ -486,6 +529,10 @@ impl Mixer {
             } else {
                 i += 1;
             }
+        }
+
+        if stopped && self.tracks.is_empty() {
+            self.filters.reset();
         }
 
         // Tick -- receive side also handles removals in same manner after it increments
@@ -518,20 +565,24 @@ impl Mixer {
 
     #[inline]
     pub fn mix_and_build_packet(&mut self, packet: &mut [u8]) -> Result<usize> {
-        // symph_mix is an `AudioBuffer` (planar format), we need to convert this
-        // later into an interleaved `SampleBuffer` for libopus.
-        self.symph_mix.clear();
-        self.symph_mix.render_reserved(Some(MONO_FRAME_SIZE));
-        self.resample_scratch.clear();
+        self.filters.remove_idle();
 
-        // Walk over all the audio files, combining into one audio frame according
-        // to volume, play state, etc.
-        let mut mix_len = {
+        let mut mix_len = if self.filters.is_empty() {
+            // symph_mix is an `AudioBuffer` (planar format), we need to convert this
+            // later into an interleaved `SampleBuffer` for libopus.
+            self.symph_mix.clear();
+            self.symph_mix.render_reserved(Some(MONO_FRAME_SIZE));
+            self.resample_scratch.clear();
+
+            // Walk over all the audio files, combining into one audio frame according
+            // to volume, play state, etc.
             let out = self.mix_tracks(packet);
 
             self.sample_buffer.copy_interleaved_typed(&self.symph_mix);
 
             out
+        } else {
+            self.mix_filtered(packet)
         };
 
         if self.muted {
@@ -613,6 +664,75 @@ impl Mixer {
         }
 
         out
+    }
+
+    // Fills one frame of filtered audio. Filters can hold audio, such as when changing
+    // playback speed, so any held audio is drained before new track audio is mixed.
+    #[inline]
+    fn mix_filtered(&mut self, packet: &mut [u8]) -> MixType {
+        let channels = self.config.mix_mode.channels();
+        let total = self.config.mix_mode.sample_count_in_frame();
+        let mut filled = 0;
+
+        // `SampleBuffer` only exposes the samples written by its last copy, so a full
+        // frame is copied in before the filters write into it.
+        self.symph_mix.clear();
+        self.symph_mix.render_reserved(Some(MONO_FRAME_SIZE));
+        self.sample_buffer.copy_interleaved_typed(&self.symph_mix);
+
+        for _ in 0..MAX_FILTER_ROUNDS {
+            if filled == total {
+                break;
+            }
+
+            let output = &mut self.sample_buffer.samples_mut()[filled..total];
+            let drained = self.filters.process(&[], output, channels, false);
+
+            if drained != 0 {
+                filled += drained * channels;
+                continue;
+            }
+
+            self.symph_mix.clear();
+            self.symph_mix.render_reserved(Some(MONO_FRAME_SIZE));
+            self.resample_scratch.clear();
+
+            let MixType::MixedPcm(frames) = self.mix_tracks(packet) else {
+                break;
+            };
+
+            if frames == 0 {
+                if self.tracks.iter().any(InternalTrack::can_continue) {
+                    break;
+                }
+
+                let output = &mut self.sample_buffer.samples_mut()[filled..total];
+
+                filled += self.filters.process(&[], output, channels, true) * channels;
+
+                if self.filters.is_finished() {
+                    self.filters.reset();
+                    break;
+                }
+
+                continue;
+            }
+
+            self.filter_input.copy_interleaved_typed(&self.symph_mix);
+
+            for plane in self.symph_mix.planes_mut().planes() {
+                plane.fill(0.0);
+            }
+
+            let input = &self.filter_input.samples()[..frames * channels];
+            let output = &mut self.sample_buffer.samples_mut()[filled..total];
+
+            filled += self.filters.process(input, output, channels, false) * channels;
+        }
+
+        self.sample_buffer.samples_mut()[filled..total].fill(0.0);
+
+        MixType::MixedPcm(filled / channels)
     }
 
     #[inline]
@@ -779,7 +899,8 @@ impl Mixer {
                 last_live_vol = track.volume;
             }
         }
-        let do_passthrough = num_live == 1 && (last_live_vol - 1.0).abs() < f32::EPSILON;
+        let do_passthrough =
+            num_live == 1 && (last_live_vol - 1.0).abs() < f32::EPSILON && self.filters.is_empty();
 
         let mut len = 0;
         for (i, track) in self.tracks.iter_mut().enumerate() {
@@ -859,7 +980,6 @@ impl Mixer {
                 MixStatus::Errored(e) =>
                     track.playing = PlayMode::Errored(PlayError::Decode(e.into())),
                 MixStatus::Ended if track.do_loop() => {
-                    drop(self.track_handles[i].seek(Duration::default()));
                     if !self.prevent_events {
                         // position update is sent out later, when the seek concludes.
                         drop(self.interconnect.events.send(EventMessage::ChangeState(
@@ -867,6 +987,20 @@ impl Mixer {
                             TrackStateChange::Loops(track.loops, false),
                         )));
                     }
+
+                    let (callback, _) = flume::bounded(1);
+
+                    track.seek(
+                        i,
+                        SeekRequest {
+                            time: Duration::default(),
+                            callback,
+                        },
+                        &self.interconnect,
+                        &self.thread_pool,
+                        &self.config,
+                        self.prevent_events,
+                    );
                 },
                 MixStatus::Ended => {
                     track.end();

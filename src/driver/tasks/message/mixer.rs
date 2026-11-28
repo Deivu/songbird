@@ -10,6 +10,7 @@ use crate::{
 };
 use flume::Sender;
 use std::{
+    any::Any,
     net::UdpSocket,
     sync::{atomic::AtomicU16, Arc, RwLock},
 };
@@ -30,6 +31,7 @@ pub enum MixerMessage {
     SetTrack(Option<Box<TrackContext>>),
 
     SetBitrate(Bitrate),
+    SetFilters(Vec<(String, Box<dyn Any + Send>)>),
     SetConfig(Config),
     SetMute(bool),
 

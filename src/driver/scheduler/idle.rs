@@ -144,8 +144,12 @@ impl Idle {
         }
 
         for id in self.to_cull.drain(..) {
-            if let Some(tx) = self.tasks.remove(&id).and_then(|t| t.cull_handle) {
-                _ = tx.send_async(()).await;
+            if let Some(task) = self.tasks.remove(&id) {
+                self.stats.remove_idle_mixers(1);
+
+                if let Some(tx) = task.cull_handle {
+                    _ = tx.send_async(()).await;
+                }
             }
         }
 
@@ -184,6 +188,8 @@ impl Idle {
                     },
                 }
             }
+        } else {
+            self.stats.remove_idle_mixers(1);
         }
     }
 

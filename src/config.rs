@@ -7,7 +7,10 @@ use crate::{
         get_default_scheduler,
         retry::Retry,
         tasks::disposal::DisposalThread,
+        AudioFilter,
         CryptoMode,
+        FilterError,
+        FilterRegistry,
         MixMode,
         Scheduler,
     },
@@ -25,6 +28,8 @@ use symphonia::core::{codecs::CodecRegistry, probe::Probe};
 use derivative::Derivative;
 #[cfg(all(feature = "driver", feature = "receive"))]
 use std::num::NonZeroU8;
+#[cfg(feature = "driver")]
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Configuration for drivers and calls.
@@ -193,6 +198,14 @@ pub struct Config {
     /// [`Driver`]: crate::Driver
     pub scheduler: Option<Scheduler>,
 
+    #[cfg(feature = "driver")]
+    /// The audio filters [`Driver::set_filters`] can create, by name.
+    ///
+    /// Defaults to empty, where no filters can be created.
+    ///
+    /// [`Driver::set_filters`]: crate::driver::Driver::set_filters
+    pub filters: FilterRegistry,
+
     // Test only attributes
     #[cfg(feature = "driver")]
     #[cfg(test)]
@@ -237,6 +250,8 @@ impl Default for Config {
             disposer: None,
             #[cfg(feature = "driver")]
             scheduler: None,
+            #[cfg(feature = "driver")]
+            filters: FilterRegistry::default(),
             #[cfg(feature = "driver")]
             #[cfg(test)]
             tick_style: TickStyle::Timed,
@@ -348,6 +363,16 @@ impl Config {
     #[must_use]
     pub fn scheduler(mut self, scheduler: Scheduler) -> Self {
         self.scheduler = Some(scheduler);
+        self
+    }
+
+    /// Registers an audio filter under `name`, replacing any filter of that name.
+    #[must_use]
+    pub fn add_filter<F>(mut self, name: impl Into<String>, constructor: F) -> Self
+    where
+        F: Fn() -> Result<Box<dyn AudioFilter>, FilterError> + Send + Sync + 'static,
+    {
+        self.filters.insert(name, Arc::new(constructor));
         self
     }
 
